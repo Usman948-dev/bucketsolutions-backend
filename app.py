@@ -1,6 +1,6 @@
-# app.py
+# app.py (Modified for Render deployment - loads pre-built models)
 from flask import Flask, request, jsonify
-from flask_cors import CORS # NEW: Import CORS
+from flask_cors import CORS 
 import pandas as pd
 from mlxtend.frequent_patterns import fpgrowth, association_rules
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -8,15 +8,24 @@ from sklearn.metrics.pairwise import cosine_similarity
 import warnings
 import joblib
 import os
-import uuid # Still useful for temp files if needed, but not for main data file
 
 warnings.filterwarnings("ignore")
 
 app = Flask(__name__)
-CORS(app) # NEW: Enable CORS for all origins (for simplicity). For production, specify origins.
-# Example for production: CORS(app, origins=["https://www.bucketsolutions.bar", "https://bucketsolutions.bar"])
+CORS(app) # Enable CORS for all origins. For production, restrict this to your frontend domain.
 
-# --- Global Data and Models ---
+# Define paths relative to the service's root on Render
+DATA_FILE_PATH = "Sample-Superstore.csv" 
+MODELS_DIR = "models" 
+MODEL_FILES = {
+    'market_basket': os.path.join(MODELS_DIR, 'market_basket.pkl'),
+    'content_based': os.path.join(MODELS_DIR, 'content_based.pkl'),
+    'collaborative': os.path.join(MODELS_DIR, 'collaborative.pkl'),
+    'products_df': os.path.join(MODELS_DIR, 'products_df.pkl'),
+    'most_popular': os.path.join(MODELS_DIR, 'most_popular.pkl')
+}
+
+# Global variables for loaded models
 sales_df = None
 tfidf_matrix = None
 cosine_sim = None
@@ -24,100 +33,55 @@ indices = None
 association_rules_df = None
 user_item_matrix = None
 most_popular_model = None
-DATA_FILE_PATH = "Sample-Superstore.csv" # Render will find this in the root of the service
 
-# --- Data Preprocessing and Model Building Functions ---
-def preprocess_data(df):
-    df.columns = df.columns.str.strip()
-    required_columns = ['Order ID', 'Order Date', 'Customer ID', 'Product Name', 'Category', 'Sub-Category', 'Sales', 'Quantity', 'Profit']
-    if not all(col in df.columns for col in required_columns):
-        missing_cols = [col for col in required_columns if col not in df.columns]
-        raise ValueError(f"Missing required columns: {', '.join(missing_cols)}")
-    df["Order Date"] = pd.to_datetime(df["Order Date"], dayfirst=True)
-    df['Sales'] = pd.to_numeric(df['Sales'], errors='coerce')
-    df['Profit'] = pd.to_numeric(df['Profit'], errors='coerce')
-    df.dropna(subset=['Sales', 'Profit', 'Product Name', 'Category', 'Customer ID', 'Order ID'], inplace=True)
-    return df
-
-def build_market_basket_model(df):
-    basket = (df.groupby(['Order ID', 'Product Name'])['Product Name']
-              .count().unstack().reset_index().fillna(0)
-              .set_index('Order ID'))
-    def encode_units(x):
-        return 1 if x > 0 else 0
-    basket_encoded = basket.applymap(encode_units)
-    try:
-        frequent_itemsets = fpgrowth(basket_encoded, min_support=0.001, use_colnames=True)
-        rules = association_rules(frequent_itemsets, metric="lift", min_threshold=1)
-        return rules
-    except (ValueError, MemoryError) as e:
-        print(f"Warning: Market Basket Analysis failed. {e}. Saving an empty model.")
-        return pd.DataFrame()
-
-def build_content_based_model(df):
-    df_cb = df.drop_duplicates(subset='Product Name')
-    df_cb.set_index('Product Name', inplace=True)
-    df_cb['combined_features'] = df_cb['Category'].fillna('') + ' ' + df_cb['Sub-Category'].fillna('')
-    tfidf = TfidfVectorizer(stop_words='english')
-    tfidf_matrix = tfdf.fit_transform(df_cb['combined_features'])
-    cosine_sim = cosine_similarity(tfidf_matrix, tfidf_matrix)
-    indices = pd.Series(df_cb.index)
-    return {'cosine_sim': cosine_sim, 'indices': indices}
-
-def build_collaborative_filtering_model(df):
-    user_item = df.groupby(['Customer ID', 'Product Name'])['Quantity'].sum().unstack().fillna(0)
-    return user_item
-
-def build_most_popular_model(df):
-    most_popular = df.groupby('Product Name')['Quantity'].sum().sort_values(ascending=False).head(10)
-    return most_popular
-
-# --- Model Initialization Logic ---
-# This function will be called once when the Flask app starts up on Render
-@app.before_first_request
-def initialize_models():
-    """Builds and loads models when the Flask app starts for the first time."""
+# --- Model Loading Logic (Called directly on app startup) ---
+# REMOVE @app.before_first_request decorator
+def load_models():
+    """Loads pre-built models from .pkl files on Flask app startup."""
     global sales_df, tfidf_matrix, cosine_sim, indices, association_rules_df, user_item_matrix, most_popular_model
-    print("--- Initializing models on Flask startup ---")
+    print("--- Loading pre-built models on Flask startup ---")
     try:
         if not os.path.exists(DATA_FILE_PATH):
             print(f"Data file '{DATA_FILE_PATH}' not found on startup. Please ensure it's in the service root.")
-            # Set models to empty/None so endpoints return appropriate messages
+            sales_df = pd.DataFrame()
             association_rules_df = pd.DataFrame()
             content_based_model_data = {'cosine_sim': None, 'indices': None}
             user_item_matrix = pd.DataFrame()
             most_popular_model = pd.Series()
-            sales_df = pd.DataFrame()
             return
             
-        df = pd.read_csv(DATA_FILE_PATH, encoding='ISO-8859-1')
-        sales_df = preprocess_data(df)
-        products_df = sales_df.drop_duplicates(subset='Product Name')
-
-        print("Building Market Basket model...")
-        association_rules_df = build_market_basket_model(sales_df)
+        # Load Market Basket model
+        association_rules_df = joblib.load(MODEL_FILES['market_basket'])
         
-        print("Building Content-Based model...")
-        content_based_model_data = build_content_based_model(sales_df)
+        # Load Content-Based model components
+        content_based_model_data = joblib.load(MODEL_FILES['content_based'])
         cosine_sim = content_based_model_data['cosine_sim']
         indices = content_based_model_data['indices']
+        sales_df = joblib.load(MODEL_FILES['products_df']) 
         
-        print("Building Collaborative Filtering model...")
-        user_item_matrix = build_collaborative_filtering_model(sales_df)
+        # Load Collaborative Filtering model
+        user_item_matrix = joblib.load(MODEL_FILES['collaborative'])
         
-        print("Building Most Popular model...")
-        most_popular_model = build_most_popular_model(sales_df)
+        # Load Most Popular model
+        most_popular_model = joblib.load(MODEL_FILES['most_popular'])
 
-        print("--- All models built and loaded successfully! ---")
-    except Exception as e:
-        print(f"An error occurred during model initialization: {e}")
+        print("--- All models loaded successfully from .pkl files! ---")
+    except FileNotFoundError as e:
+        print(f"Error loading model files: {e}. Ensure 'models' folder and .pkl files are present in your repo.")
+        sales_df = pd.DataFrame()
         association_rules_df = pd.DataFrame()
         content_based_model_data = {'cosine_sim': None, 'indices': None}
         user_item_matrix = pd.DataFrame()
         most_popular_model = pd.Series()
+    except Exception as e:
+        print(f"An unexpected error occurred during model loading: {e}")
         sales_df = pd.DataFrame()
+        association_rules_df = pd.DataFrame()
+        content_based_model_data = {'cosine_sim': None, 'indices': None}
+        user_item_matrix = pd.DataFrame()
+        most_popular_model = pd.Series()
 
-# --- Flask Endpoints ---
+# --- Flask Endpoints (same as before) ---
 @app.route('/', methods=['GET'])
 def home():
     return "<h1>Recommendation Engine API is Running!</h1>"
@@ -133,20 +97,43 @@ def upload_file():
         return jsonify({"error": "No selected file"}), 400
     
     try:
-        # Save the uploaded file to Colab's file system (or Render's ephemeral storage)
         file.save(DATA_FILE_PATH)
-        # Re-initialize models after new file upload
-        initialize_models()
+        initialize_models_after_upload() 
         return jsonify({"message": "File uploaded and models built successfully."})
     except Exception as e:
         print(f"Error processing uploaded file: {e}")
         return jsonify({"error": f"Error processing uploaded file: {e}"}), 500
 
+def initialize_models_after_upload():
+    """Rebuilds models from the newly uploaded data."""
+    global sales_df, tfidf_matrix, cosine_sim, indices, association_rules_df, user_item_matrix, most_popular_model
+    print("--- Rebuilding models after new file upload ---")
+    try:
+        df = pd.read_csv(DATA_FILE_PATH, encoding='ISO-8859-1')
+        sales_df = preprocess_data(df)
+        products_df = sales_df.drop_duplicates(subset='Product Name')
+
+        association_rules_df = build_market_basket_model(sales_df)
+        content_based_model_data = build_content_based_model(sales_df)
+        cosine_sim = content_based_model_data['cosine_sim']
+        indices = content_based_model_data['indices']
+        user_item_matrix = build_collaborative_filtering_model(sales_df)
+        most_popular_model = build_most_popular_model(sales_df)
+
+        print("--- Models rebuilt successfully from new data! ---")
+    except Exception as e:
+        print(f"An error occurred during model rebuilding after upload: {e}")
+        association_rules_df = pd.DataFrame()
+        content_based_model_data = {'cosine_sim': None, 'indices': None}
+        user_item_matrix = pd.DataFrame()
+        most_popular_model = pd.Series()
+        sales_df = pd.DataFrame()
+
 
 @app.route('/recommend/basket', methods=['POST'])
 def get_basket_recommendations():
     if association_rules_df.empty:
-        return jsonify({"recommendations": []}), 200 # Return empty list if no rules found
+        return jsonify({"recommendations": []}), 200 
     
     items_in_cart = request.json.get('items', [])
     if not items_in_cart:
@@ -211,13 +198,12 @@ def get_most_popular_recommendations():
     recommendations = most_popular_model.index.tolist()
     return jsonify({"recommendations": recommendations})
 
-# --- Flask endpoint to serve the HTML dashboard (Static Files) ---
-# Render can serve static files directly if you put them in a 'static' folder.
-# For this setup, the front-end will be a separate static site.
-# This endpoint is just a placeholder if you wanted Flask to serve HTML.
-# For this deployment, the React app is a separate service.
+# Flask endpoint to serve the HTML dashboard (Render will serve static files)
 @app.route('/dashboard', methods=['GET'])
 def serve_dashboard():
+    # This endpoint is just a placeholder if you wanted Flask to serve HTML.
+    # For this deployment, the React app is a separate static site.
     return "Front-end is served from a separate static site!"
 
-# No app.run() here. Gunicorn (via Procfile) will run the app.
+# Call load_models directly on app startup
+load_models() # NEW: Call load_models directly here
